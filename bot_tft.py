@@ -3,6 +3,8 @@ from discord.ext import commands
 import aiohttp
 import json
 import os
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
 
 # CONFIG (change ici)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -343,6 +345,223 @@ async def history(ctx, *, name: str):
 
     await ctx.send(embed=embed)
 
+@bot.command(aliases=["ranked_History"])
+async def ranked(ctx, *, args: str):
+    # ---------- Parser le pseudo + nombre de parties ----------
+    default_count = 5
+    count = default_count
+    name = args.strip()
+
+    # on sépare pseudo et nombre de games
+    parts = args.rsplit(" ", 1)
+
+    if len(parts) == 2:
+        raw_count = parts[1].replace(",", ".")  # gère x.x et x,x
+        try:
+            value = float(raw_count)
+            count = int(value)
+
+            # Bornes
+            if count < 1:
+                count = 1
+            if count > 10:
+                count = 10
+
+            name = parts[0].strip()
+        except ValueError:
+            # si ce n'est pas un nombre, on garde tout comme pseudo
+            name = args.strip()
+
+    name = name.strip()
+
+    if not name:
+        await ctx.send("❌ Tu dois préciser un pseudo. Exemple : `!ranked Γαχιss 3`")
+        return
+
+    players = load_players()
+    player = next((p for p in players if p['name'].lower() == name.lower()), None)
+
+    if not player:
+        await ctx.send(f"❌ **{name}** n'est pas dans la liste.")
+        return
+
+    async with aiohttp.ClientSession() as session:
+
+        # On récupère plus de games brutes car filtrage (normal / ranked)
+        raw_limit = count * 4
+        if raw_limit < 20:
+            raw_limit = 20
+        if raw_limit > 80:
+            raw_limit = 80
+
+        match_ids = await get_match_ids(session, player['uuid'], raw_limit)
+
+        if not match_ids:
+            await ctx.send("❌ Impossible de récupérer l'historique.")
+            return
+
+        matches = []
+        for match_id in match_ids:
+            data = await get_match_data(session, match_id)
+            if not data:
+                continue
+
+            info = data.get("info", {})
+
+            # On garde que les ranked : queue_id = 1100
+            if info.get("queue_id") != 1100:
+                continue
+
+            # Chercher le participant correspondant
+            for p in info.get("participants", []):
+                if p["puuid"] == player["uuid"]:
+                    matches.append(p)
+                    break
+
+            # On s'arrête dès qu'on a le nombre de games demandé
+            if len(matches) >= count:
+                break
+
+    if not matches:
+        await ctx.send(f"⚪ **{name}** n'a pas de parties classées récentes.")
+        return
+
+    # ---------- Emoji par placement ----------
+    PLACEMENT_EMOJIS = {
+        1: "🥇",
+        2: "🥈",
+        3: "🥉",
+        4: "🙂",
+        5: "🙃",
+        6: "😥",
+        7: "😢",
+        8: "😭",
+    }
+
+    CDRAGON_BASE = "https://raw.communitydragon.org/latest/game/assets/ux/tft/championsplashes/patching"
+
+    def get_tft16_icon_url(character_id: str) -> str:
+        base = character_id.lower()
+        return f"{CDRAGON_BASE}/{base}_square.tft_set16.png"
+    
+    async def build_comp_image(units):
+        size = 80
+        star_band_height = 30
+        champ_imgs = []
+        tiers = []
+
+        emoji_font_path = r"C:\Windows\Fonts\seguiemj.ttf"
+        try:
+            font = ImageFont.truetype(emoji_font_path, 20)
+        except Exception:
+            font = ImageFont.load_default()
+
+        async with aiohttp.ClientSession() as session:
+            for u in units:
+                char_id = u.get("character_id")
+                if not char_id:
+                    continue
+
+                url = get_tft16_icon_url(char_id)
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.read()
+                except:
+                    continue
+
+                try:
+                    img = Image.open(BytesIO(data)).convert("RGBA")
+                    img = img.resize((size, size))
+
+                    champ_imgs.append(img)
+                    tiers.append(u.get("tier", 1))
+                except:
+                    continue
+
+        if not champ_imgs:
+            return None
+
+        # tier
+        def tier_to_emoji(tier: int) -> str:
+            if tier == 1:
+                return "⭐"
+            elif tier == 2:
+                return "⭐⭐"
+            else:
+                return "⭐⭐⭐"
+
+        # image finale
+        width = size * len(champ_imgs)
+        height = star_band_height + size
+        final_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(final_img)
+
+        for idx, img in enumerate(champ_imgs):
+            x = idx * size
+
+            stars_text = tier_to_emoji(tiers[idx])
+
+            try:
+                bbox = draw.textbbox((0, 0), stars_text, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            except AttributeError:
+                text_w, text_h = font.getsize(stars_text)
+
+            text_x = x + (size - text_w) // 2
+            text_y = (star_band_height - text_h) // 2
+
+            draw.text((text_x + 1, text_y + 1), stars_text,
+                    fill=(0, 0, 0, 255), font=font)
+            draw.text((text_x, text_y), stars_text,
+                    fill=(255, 255, 255, 255), font=font)
+
+            final_img.paste(img, (x, star_band_height), img)
+
+        buf = BytesIO()
+        final_img.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
+
+    # ---------- Envoi des embeds ----------
+    for i, m in enumerate(matches, 1):
+        placement = m["placement"]
+        emoji = PLACEMENT_EMOJIS.get(placement, "")
+        time_min = round(m["time_eliminated"] / 60)
+
+        units = m.get("units", [])
+
+        embed = discord.Embed(
+            title=f"Partie classée #{i} — Top {placement} {emoji}",
+            color=0x9b59b6
+        )
+
+        embed.add_field(
+            name="Temps élimination",
+            value=f"{time_min} min",
+            inline=False
+        )
+
+        embed.add_field(
+            name="Composition",
+            value="(voir ci-dessous 👇)",
+            inline=False
+        )
+
+        embed.set_footer(text="Top 1 = incroyable 🥇! Top 8 = dommage 😭...")
+
+        comp_buf = await build_comp_image(units)
+
+        if comp_buf is not None:
+            filename = f"comp_{i}.png"
+            file = discord.File(comp_buf, filename=filename)
+            embed.set_image(url=f"attachment://{filename}")
+            await ctx.send(embed=embed, file=file)
+        else:
+            await ctx.send(embed=embed)
+
 @bot.command(aliases=["helpme", "commands"])
 async def commande(ctx):
     embed = discord.Embed(
@@ -399,5 +618,6 @@ async def commande(ctx):
     )
 
     await ctx.send(embed=embed)
+
 
 bot.run(DISCORD_TOKEN)
